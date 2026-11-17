@@ -159,26 +159,6 @@ Login from `~/.oci/config` or the same `OCI_*` environment values. `--dry-run` s
 Rules from Oracle: free servers only in the home region, 2 OCPU + 12 GB of A1 in total, one account per person.
 So one account covers one MP region. For the other regions use the owner's own account (a team member there) or a paid VPS with `vps-setup.sh`.
 
-### 5.00.04: every region on its own Oracle server, near its players
-
-- One login per region, claimed in parallel: add `OCI_USER_EUROPE`, `OCI_TENANCY_EUROPE`, `OCI_FINGERPRINT_EUROPE`,
-  `OCI_REGION_EUROPE`, `OCI_KEY_EUROPE` (same with `_ASIA`, `_NA`, `_OCEANIA`; optional `DUCKDNS_TOKEN_<REGION>`).
-  A friend who lives in that region makes the free account there (Frankfurt, Ashburn, Sydney...), so that region's
-  server is near its players instead of near the owner. Regions without a login are skipped.
-- `python3 oracle/mp_oracle.py regioncheck` (also runs in the workflow, no login needed) shows where every region
-  name really is and warns when two names are the same machine or a name sits on another continent.
-  Today all four names point at one home IP in the Philippines, so Europe / NA / Oceania players ping Mindanao.
-  Fix: on duckdns.org point each name at that region's server, and let a home updater only touch its own name.
-- The server keeps its DuckDNS name on both IPv4 and IPv6 (every 5 minutes), like
-  [ha-duckdns_ipv4_ipv6](https://github.com/lfhohmann/ha-duckdns_ipv4_ipv6) and
-  [duckdns-mirror](https://github.com/BenjaminHCCarr/duckdns-mirror).
-- Custom servers on phones: the game now finds the host's own location and address (router UPnP mapping or the
-  host's own free DuckDNS name in Server console), so friends connect straight to the host - the ping is the
-  real distance to the host, not to this broker. Mobile data (carrier NAT) still goes through the broker.
-- Other brokers that speak the same MQTT: [emqx-docker](https://github.com/ThirtyFoxMCx00E1/emqx-docker),
-  [rmqtt](https://github.com/ThirtyFoxMCx00E1/rmqtt) (small Rust broker for 1 GB servers like the Oracle E2 Micro);
-  test clients in [MQTT-Client-Examples](https://github.com/ThirtyFoxMCx00E1/MQTT-Client-Examples).
-
 ## Debian 12 (own PC or VPS)
 
 Debian 12 works the same as Ubuntu and is a much smaller download. The official installer is on [Debian's archive](https://cdimage.debian.org/cdimage/archive/12.15.0/amd64/iso-cd/):
