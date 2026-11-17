@@ -1,49 +1,74 @@
 # MP Oracle: claims the Oracle Cloud Always Free Ampere A1 server for one MP region and installs
-# HiveMQ + the 24/7 servers on it (oracle/mp_oracle.py). Runs every hour for 50 minutes until Oracle
+# HiveMQ + the 24/7 servers on it (oracle/mp_oracle.py; 5.00.04: the same workflow as in wagu, so the HiveMQ repo has its own OCI claimer again). Runs every hour for 50 minutes until Oracle
 # has free capacity, then every run just sees "mp-<region> already exists" and stops in seconds.
 # Setup (phone browser is fine): repo Settings -> Secrets and variables -> Actions -> New secret:
 #   OCI_USER, OCI_TENANCY, OCI_FINGERPRINT, OCI_REGION, OCI_KEY   (from Oracle: Profile -> API keys)
 #   optional: DUCKDNS_TOKEN, DISCORD_WEBHOOK, SSH_PUBLIC_KEY
 # and the variable MP_REGION = asia / europe / na / oceania (Variables tab). Then Actions -> MP Oracle claim -> Run.
+# 5.00.04: one Oracle account per region, so every region gets a server in its own part of the world
+# (Always Free = home region only). Friends in other regions add their own login as
+#   OCI_USER_EUROPE, OCI_TENANCY_EUROPE, OCI_FINGERPRINT_EUROPE, OCI_REGION_EUROPE, OCI_KEY_EUROPE
+#   (same for _ASIA, _NA, _OCEANIA; optional DUCKDNS_TOKEN_<REGION>)
+# and each region is claimed in parallel; a region without a login is skipped in a second.
+# The unsuffixed OCI_* login is used for MP_REGION (or the home region). Every run also checks that
+# mpsamp/eusamp/nasamp/ocsamp.duckdns.org are really servers in their own regions (regioncheck).
 name: MP Oracle claim
 on:
   workflow_dispatch:
     inputs:
       region:
-        description: "MP region (asia, europe, na, oceania; empty = from the Oracle home region)"
+        description: "MP region for the unsuffixed OCI_* login (asia, europe, na, oceania; empty = from the Oracle home region)"
         required: false
         default: ""
       command:
-        description: "check, claim or status"
+        description: "check, claim, status or regioncheck"
         required: false
         default: "claim"
   schedule:
-    - cron: "7 * * * *"
+    - cron: "37 * * * *"
 concurrency:
   group: mp-oracle
   cancel-in-progress: false
 permissions:
   contents: read
 jobs:
+  regioncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Region names in their own regions?
+        run: python3 oracle/mp_oracle.py regioncheck | tee rc.txt
+      - name: Summary
+        if: always()
+        run: |
+          { echo "### MP region names"; echo '```'; sed 's/\x1b\[[0-9;]*m//g' rc.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
   claim:
     runs-on: ubuntu-latest
     timeout-minutes: 58
+    strategy:
+      fail-fast: false
+      matrix:
+        acct: [main, ASIA, EUROPE, NA, OCEANIA]
     env:
-      OCI_USER: ${{ secrets.OCI_USER }}
-      OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
-      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
-      OCI_REGION: ${{ secrets.OCI_REGION }}
-      OCI_KEY: ${{ secrets.OCI_KEY }}
-      DUCKDNS_TOKEN: ${{ secrets.DUCKDNS_TOKEN }}
+      ACCT: ${{ matrix.acct }}
+      OCI_USER: ${{ matrix.acct == 'main' && secrets.OCI_USER || secrets[format('OCI_USER_{0}', matrix.acct)] }}
+      OCI_TENANCY: ${{ matrix.acct == 'main' && secrets.OCI_TENANCY || secrets[format('OCI_TENANCY_{0}', matrix.acct)] }}
+      OCI_FINGERPRINT: ${{ matrix.acct == 'main' && secrets.OCI_FINGERPRINT || secrets[format('OCI_FINGERPRINT_{0}', matrix.acct)] }}
+      OCI_REGION: ${{ matrix.acct == 'main' && secrets.OCI_REGION || secrets[format('OCI_REGION_{0}', matrix.acct)] }}
+      OCI_KEY: ${{ matrix.acct == 'main' && secrets.OCI_KEY || secrets[format('OCI_KEY_{0}', matrix.acct)] }}
+      DUCKDNS_TOKEN: ${{ (matrix.acct != 'main' && secrets[format('DUCKDNS_TOKEN_{0}', matrix.acct)]) || secrets.DUCKDNS_TOKEN }}
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
       SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
-      MP_REGION: ${{ github.event.inputs.region || vars.MP_REGION }}
+      MP_REGION: ${{ matrix.acct == 'main' && (github.event.inputs.region || vars.MP_REGION) || '' }}
     steps:
       - name: Login set?
         id: gate
         run: |
+          if [ "$ACCT" != main ]; then echo "MP_REGION=$(echo "$ACCT" | tr A-Z a-z)" >> "$GITHUB_ENV"; fi
           if [ -z "$OCI_USER" ] || [ -z "$OCI_KEY" ] || [ -z "$OCI_TENANCY" ]; then
-            echo "No Oracle login in the repo secrets yet (OCI_USER, OCI_TENANCY, OCI_FINGERPRINT, OCI_REGION, OCI_KEY) - nothing to do."
+            if [ "$ACCT" = main ]; then S=""; else S="_$ACCT"; fi
+            echo "No Oracle login for $ACCT yet (OCI_USER$S, OCI_TENANCY$S, OCI_FINGERPRINT$S, OCI_REGION$S, OCI_KEY$S) - skipped."
             echo "go=0" >> "$GITHUB_OUTPUT"
           else
             echo "go=1" >> "$GITHUB_OUTPUT"
@@ -62,7 +87,7 @@ jobs:
         if: steps.gate.outputs.go == '1'
         run: |
           CMD="${{ github.event.inputs.command || 'claim' }}"
-          if [ "$CMD" = claim ]; then python3 oracle/mp_oracle.py claim --minutes 50
+          if [ "$CMD" = claim ]; then python3 oracle/mp_oracle.py claim --minutes 50 --wait 30
           else python3 oracle/mp_oracle.py "$CMD"; fi
       - name: Summary
         if: always() && steps.gate.outputs.go == '1'
@@ -71,8 +96,8 @@ jobs:
           if [ -n "$IP" ]; then
             echo "### MP Oracle: $RG server $IP" >> "$GITHUB_STEP_SUMMARY"
             echo "Put this IP in regions.txt / DuckDNS if DUCKDNS_TOKEN is not set. It installs itself in about 15 minutes." >> "$GITHUB_STEP_SUMMARY"
-            # 3.32: the MP Oracle page (thirtyfoxmcx00e1.github.io/wagu/oracle.html) reads this annotation
+            # 3.32: the MP Oracle page (mpsamp-open.github.io/oracle.html) reads this annotation
             echo "::notice title=MP Oracle::$RG server $IP (installs itself in about 15 minutes)"
           else
-            echo "::notice title=MP Oracle::no server yet (${RG:-region ?}): Oracle out of free capacity or login refused - retried every hour"
+            echo "::notice title=MP Oracle::no server yet (${RG:-region ?}, login $ACCT): Oracle out of free capacity or login refused - retried every hour"
           fi

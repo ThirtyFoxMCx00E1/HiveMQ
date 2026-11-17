@@ -15,7 +15,7 @@ set -uo pipefail
 RW_VERSION="4.13.16"
 DEFAULT_APP="discordpy-bot"
 DEFAULT_REPO="https://github.com/ThirtyFoxMCx00E1/discordpy-bot.git"
-SELF_URL="https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/railway/mp-railway.sh"
+SELF_URL="https://mpsamp-open.github.io/HiveMQ/railway/mp-railway.sh"
 
 SINCE=""; SINCE_LINE=0
 if [[ "${PREFIX:-}" == */com.termux/* ]] || [ "${MP_RAILWAY_MODE:-}" = user ]; then
@@ -296,7 +296,7 @@ cmd_setup() {
     deploy "$app" || die "not online yet - fix the message above, then: sudo mp-railway restart"
     echo
     say "Done. The bot now runs 24/7 here: restarts on crash and on reboot, and every push to"
-    say "$REPO is deployed by itself within 2 minutes. Website: https://thirtyfoxmcx00e1.github.io/wagu/railway.html"
+    say "$REPO is deployed by itself within 2 minutes. Website: https://mpsamp-open.github.io/railway.html"
 }
 
 cmd_status() {

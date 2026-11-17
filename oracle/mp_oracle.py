@@ -18,6 +18,7 @@ Usage (any Linux / Termux with python3, or the GitHub Actions workflow "MP Oracl
   python3 oracle/mp_oracle.py claim --region europe            # keeps trying until it gets the server
   python3 oracle/mp_oracle.py claim --region europe --minutes 50   # stop after 50 min (Actions)
   python3 oracle/mp_oracle.py status
+  python3 oracle/mp_oracle.py regioncheck                       # is each region name a server in that region?
   python3 oracle/mp_oracle.py claim --dry-run                  # show what it would create
 
 Login: ~/.oci/config (OCI_CONFIG=path) or the environment (the Actions secrets):
@@ -47,7 +48,7 @@ DUCK = {"asia": "mpsamp", "europe": "eusamp", "na": "nasamp", "oceania": "ocsamp
 # low-ping home region to pick at Oracle sign-up for each MP region
 BEST = {"asia": "ap-singapore-1 (Singapore)", "europe": "eu-frankfurt-1 (Frankfurt)",
         "na": "us-ashburn-1 (Ashburn, Virginia)", "oceania": "ap-sydney-1 (Sydney)"}
-SETUP = "https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/vps-setup.sh"
+SETUP = "https://mpsamp-open.github.io/HiveMQ/vps-setup.sh"
 
 
 def say(msg):
@@ -237,10 +238,18 @@ def user_data(region):
         "set -x",
     ]
     if token:
+        # 5.00.04: IPv4 + IPv6 (the ha-duckdns_ipv4_ipv6 idea): DuckDNS keeps both, so players on IPv6-only
+        # mobile networks reach the region server without the carrier's IPv4 NAT in the middle
         lines += [
-            "echo '*/5 * * * * root curl -fsS \"https://www.duckdns.org/update?domains=%s&token=%s&ip=\" >/dev/null' > /etc/cron.d/duckdns" % (duck, token),
+            "cat > /usr/local/bin/mp-duck <<'EOF'",
+            "#!/bin/sh",
+            "V6=$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2}' | cut -d/ -f1 | grep -v '^f[cd]' | head -n1)",
+            "curl -fsS \"https://www.duckdns.org/update?domains=%s&token=%s&ip=&ipv6=$V6\"" % (duck, token),
+            "EOF",
+            "chmod 700 /usr/local/bin/mp-duck",
+            "echo '*/5 * * * * root /usr/local/bin/mp-duck >/dev/null 2>&1' > /etc/cron.d/duckdns",
             "chmod 600 /etc/cron.d/duckdns",
-            "for i in 1 2 3; do curl -fsS 'https://www.duckdns.org/update?domains=%s&token=%s&ip=' && break; sleep 10; done" % (duck, token),
+            "for i in 1 2 3; do /usr/local/bin/mp-duck && break; sleep 10; done",
             "sleep 60",
         ]
     lines += [
@@ -284,6 +293,53 @@ def github_output(**kv):
         with open(out, "a") as f:
             for k, v in kv.items():
                 f.write("%s=%s\n" % (k, v))
+
+
+# 5.00.04: is every region name really in its region? (all four names pointing at one home IP = every
+# player in the world pings that one house - e.g. Cagayan de Oro - instead of a server near them)
+CONTINENT = {"asia": {"AS"}, "europe": {"EU"}, "na": {"NA"}, "oceania": {"OC"}}
+
+
+def cmd_regioncheck(args):
+    import socket
+    seen, bad = {}, 0
+    for reg, duck in DUCK.items():
+        host = duck + ".duckdns.org"
+        try:
+            v4 = sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET)})
+        except OSError:
+            v4 = []
+        try:
+            v6 = sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET6)})
+        except OSError:
+            v6 = []
+        if not v4 and not v6:
+            warn("%-8s %s: no address (no server for this region yet)" % (reg, host))
+            continue
+        ip = (v4 or v6)[0]
+        geo = {}
+        try:
+            geo = json.loads(urllib.request.urlopen("https://ipwho.is/" + ip, timeout=15).read().decode())
+        except Exception as e:  # noqa: BLE001
+            warn("geo lookup for %s failed: %s" % (ip, e))
+        where = "%s, %s, %s (%s)" % (geo.get("city", "?"), geo.get("region", "?"), geo.get("country", "?"),
+                                     (geo.get("connection") or {}).get("isp", "?"))
+        say("%-8s %s -> %s%s  %s" % (reg, host, ", ".join(v4), (" + " + ", ".join(v6)) if v6 else "", where))
+        cont = geo.get("continent_code", "")
+        if cont and cont not in CONTINENT[reg]:
+            warn("  %s is in %s, not in %s: players there get a far ping. Point %s at a server in %s (Oracle home region %s)"
+                 % (host, geo.get("continent", cont), reg, host, reg, BEST[reg]))
+            bad += 1
+        if ip in seen:
+            warn("  %s is the same machine as %s.duckdns.org (%s): the region split does nothing" % (host, seen[ip], ip))
+            bad += 1
+        seen.setdefault(ip, duck)
+    if bad:
+        say("fix: duckdns.org -> each name -> the IP of the server in that region (or set DUCKDNS_TOKEN and let"
+            " the claim workflow do it); a home updater must only update its own region name")
+    else:
+        say("every region name is its own server in its own region")
+    return 1 if bad and args.strict else 0
 
 
 def cmd_check(o, args):
@@ -403,7 +459,8 @@ def cmd_claim(o, args):
 
 def main():
     ap = argparse.ArgumentParser(description="MP Oracle: claim the Oracle Always Free A1 server for an MP region")
-    ap.add_argument("command", choices=["check", "claim", "status"])
+    ap.add_argument("command", choices=["check", "claim", "status", "regioncheck"])
+    ap.add_argument("--strict", action="store_true", help="regioncheck: exit 1 on a problem")
     ap.add_argument("--region", default=os.environ.get("MP_REGION", ""), help="asia, europe, na or oceania (default: from the home region)")
     ap.add_argument("--ocpus", type=float, default=2)
     ap.add_argument("--memory", type=float, default=12)
@@ -413,6 +470,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     args.wait = max(30, args.wait)
+    if args.command == "regioncheck":  # no Oracle login needed
+        sys.exit(cmd_regioncheck(args))
     o = Oracle(load_config())
     sys.exit({"check": lambda: cmd_check(o, args) and 0, "claim": lambda: cmd_claim(o, args),
               "status": lambda: cmd_status(o, args)}[args.command]() or 0)

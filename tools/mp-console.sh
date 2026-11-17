@@ -57,7 +57,7 @@ servers_menu() {
 }
 RW=/usr/local/bin/mp-railway
 railway_menu() {
-    [ -x "$RW" ] || { curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/railway/mp-railway.sh -o /tmp/mp-railway.sh && bash /tmp/mp-railway.sh install; }
+    [ -x "$RW" ] || { curl -fsSL https://mpsamp-open.github.io/HiveMQ/railway/mp-railway.sh -o /tmp/mp-railway.sh && bash /tmp/mp-railway.sh install; }
     while true; do
         clear; c '1;35' "  MP Railway - our own Railway (Discord bot 24/7)"; echo; line
         "$RW" status 2>/dev/null | sed 's/^/  /'
@@ -91,7 +91,7 @@ while true; do
     echo "  9) shell (bash)           0) logout"
     echo "  s) the 4 servers: log / start / stop / restart each one"
     echo "  o) old MP versions refused (name, version, phone id, IP)"
-    echo "  r) MP Railway: Discord bot 24/7 (/gen /statsdc /chardc)"
+    echo "  r) MP Railway: Discord bot 24/7 (/gen /stats /help /streaming)"
     line
     read -r -p "  choose: " k || exit 0
     case "$k" in
@@ -101,7 +101,7 @@ while true; do
         4) systemctl restart hivemq && echo restarted; sleep 2 ;;
         5) rm -f "$HOLD"/mp-server "$HOLD"/mp-bcw "$HOLD"/mp-mw3 "$HOLD"/mp-rp; systemctl restart mp-server mp-bcw mp-mw3 mp-rp mp-legacy && echo restarted; sleep 2 ;;
         6) rm -f "$HOLD"/*; systemctl restart hivemq mp-server mp-bcw mp-mw3 mp-rp mp-legacy mp-status; systemctl is-enabled -q mp-bridge 2>/dev/null && systemctl restart mp-bridge; echo restarted; sleep 2 ;;
-        7) REGION="${REGION:-Asia}" bash /opt/mp/kit/update.sh 2>/dev/null || curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/update.sh | REGION="${REGION:-Asia}" bash; read -r -p "  enter to continue" _ ;;
+        7) REGION="${REGION:-Asia}" bash /opt/mp/kit/update.sh 2>/dev/null || curl -fsSL https://mpsamp-open.github.io/HiveMQ/update.sh | REGION="${REGION:-Asia}" bash; read -r -p "  enter to continue" _ ;;
         8) /opt/mp/kit/tools/make-regions.sh; read -r -p "  enter to continue" _ ;;
         o|O) { echo "time  name  version  phone  IP  port"; tail -n 200 /opt/mp/server/outdated_clients.log 2>/dev/null || echo "(none yet)"; } | less -R ;;
         9) echo "type exit to come back"; bash -l ;;

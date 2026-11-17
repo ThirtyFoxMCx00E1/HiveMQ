@@ -16,6 +16,9 @@
 #   - optional TLS (Let's Encrypt) for MQTT 8883 and WebSocket 8884 (the website needs 8884)
 #   - web console (ttyd, https://DOMAIN:7681, password) + status beacon for the website's Termius page
 #   - 3.21.7: MP Railway (our own Railway): the Discord login bot 24/7, auto deploy on git push
+#   - 3.37 VPS: low-latency tuning (XDP game-port filter, conntrack bypass, NIC / CPU / THP tuning),
+#     cache + log trim timer, and NO broker / server restart on an update unless something really changed
+#     (players stay connected). The kit now lives in the wagu repo (HiveMQ/ folder) - one repo for everything.
 set -euo pipefail
 
 # 3.25: HiveMQ CE comes from our own fork first (ThirtyFoxMCx00E1/hivemq-community-edition, Apache 2.0,
@@ -33,11 +36,12 @@ HIVEMQ_SHA256="fd005e535eca0baffb085e11b1512885d06ce00786f961701c76449816f7dec5"
 RBAC_VER="4.6.18"
 RBAC_URL="https://github.com/hivemq/hivemq-file-rbac-extension/releases/download/${RBAC_VER}/hivemq-file-rbac-extension-${RBAC_VER}.zip"
 RBAC_SHA256="4089d09e5d2b6621a07aa86032230dce5aefbcc37130ef5c714fb6fa7185e3e6"
-JDK_X64_URL="https://github.com/ThirtyFoxMCx00E1/wagu/releases/download/Assets-1-2/OpenJDK21U-jdk_x64_linux_hotspot_21.0.13_9.tar.gz"   # 3.10: wagu release "HiveMQ + OpenJDK Java 21"
+JDK_X64_URL="https://github.com/ThirtyFoxMCx00E1/wagu/releases/download/Assets-1-2-3/OpenJDK21U-jdk_x64_linux_hotspot_21.0.13_9.tar.gz"   # 3.10: wagu release "HiveMQ + OpenJDK Java 21" (3.40.1: tag Assets-1-2-3)
 JDK_X64_FALLBACK="https://api.adoptium.net/v3/binary/latest/21/ga/linux/x64/jdk/hotspot/normal/eclipse"
 JDK_ARM_URL="https://api.adoptium.net/v3/binary/latest/21/ga/linux/aarch64/jdk/hotspot/normal/eclipse"
 MOD_REPO="https://github.com/ThirtyFoxMCx00E1/wagu.git"
-KIT_REPO="https://github.com/ThirtyFoxMCx00E1/HiveMQ.git"
+# 3.37 VPS: the kit is the HiveMQ/ folder of wagu (the separate HiveMQ repo is no longer used)
+KIT_REPO="$MOD_REPO"
 
 BASE=/opt/mp
 ETC=/etc/mp-hivemq
@@ -48,6 +52,21 @@ say()  { printf '\033[1;36m[mp]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[mp]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[mp]\033[0m %s\n' "$*" >&2; exit 1; }
 rand() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-24}" || true; }
+# 3.37 VPS: fast clone of only the folders we need from wagu (the repo has big release zips)
+#   wagu_clone DEST folder...   (falls back to a normal shallow clone on old git)
+SITE_URL="${MP_SITE_URL:-https://mpsamp-open.github.io}"   # 4.12.7: wagu is private, the website serves the public files
+wagu_clone() {
+    local d=$1; shift; rm -rf "$d"
+    # server/ + src/net + third_party/mbedtls = downloads/mp-server-src.tar.gz on the website
+    if [ "$*" = "server src/net third_party/mbedtls" ] && mkdir -p "$d" \
+       && curl -fsSL --retry 3 "$SITE_URL/downloads/mp-server-src.tar.gz" | tar -xz -C "$d"; then return 0; fi
+    rm -rf "$d"
+    if git clone -q --depth 1 --filter=blob:none --sparse "$MOD_REPO" "$d" </dev/null 2>/dev/null \
+       && git -C "$d" sparse-checkout set "$@" </dev/null 2>/dev/null; then return 0; fi
+    rm -rf "$d"; git clone -q --depth 1 "$MOD_REPO" "$d" </dev/null
+}
+sum() { cat "$@" 2>/dev/null | sha256sum | cut -c1-16; }   # content hash of files (missing = empty)
+CHANGED=" "   # services whose files changed in this run (only those are restarted)
 
 [ "$(id -u)" = 0 ] || die "run as root: sudo ./install.sh --region Asia"
 
@@ -122,6 +141,30 @@ CONSOLE_PASS=$(rand 20)
 # 1 = also serve the console without TLS on http://IP:7681 (not recommended)
 CONSOLE_INSECURE=0
 EOF
+# 3.37 VPS: speed settings
+grep -q '^XDP=' "$ENV_FILE" || cat >> "$ENV_FILE" <<EOF
+
+# 3.37 VPS: XDP filter on the game UDP ports (drops floods / junk before Linux sees them). 0 = off
+XDP=1
+# packets per second per source IP before drops. High on purpose: many phones share one carrier IP (CGNAT)
+XDP_PPS=20000
+# extra IPs that are never limited (the HOST_* brokers are added by themselves)
+XDP_ALLOW=
+# game UDP skips connection tracking (faster, never "table full"). 0 = off
+NOTRACK=1
+# a running server is restarted by the keep-alive only after this many failed checks in a row (1 per minute)
+KEEPALIVE_STRIKES=3
+EOF
+# 3.38: 24/7 bot hosts also in the free public lobby (phones that can't reach this VPS still join them)
+grep -q '^PUBLIC_MIRROR=' "$ENV_FILE" || cat >> "$ENV_FILE" <<EOF
+
+# 3.38: list this region's 24/7 servers (default, Brief Case War, MW3, Mega Vil Futuristic) in the
+# public lobby too and carry their game frames, so a phone on the public lobby joins the bot host
+# instead of hosting a copy that drops everybody when it leaves. 0 = off
+PUBLIC_MIRROR=1
+# public brokers to list them on (space separated)
+PUBLIC_MIRROR_BROKERS="mqtt://broker.hivemq.com:1883"
+EOF
 # shellcheck disable=SC1090
 . "$ENV_FILE"
 # 3.33: servers installed before 3.33 have the old 512 KB/s limit in mp.env: raise it (ping went high when a relay host got busy)
@@ -157,7 +200,7 @@ say "machine: $ARCH, $CPUS vCPU, $RAM_MB MB RAM"
 export DEBIAN_FRONTEND=noninteractive
 say "installing packages"
 apt-get update -qq
-apt-get install -y -qq curl ca-certificates unzip tar openssl ufw git make g++ python3 >/dev/null
+apt-get install -y -qq curl ca-certificates unzip tar openssl ufw git make g++ python3 ethtool iptables >/dev/null
 [ -n "${DOMAIN:-}" ] && apt-get install -y -qq certbot >/dev/null
 
 id mp >/dev/null 2>&1 || useradd --system --home "$BASE" --shell /usr/sbin/nologin mp
@@ -179,6 +222,9 @@ fi
 "$JAVA_HOME/bin/java" -version 2>&1 | head -1
 
 # ---------------------------------------------------------------- HiveMQ CE + RBAC
+# 3.37 VPS: fingerprint of everything the broker reads, BEFORE this run (restart only if it changes)
+HQ_FILES=("$BASE/hivemq/.version" "$BASE/hivemq/conf/config.xml" "$BASE/hivemq/extensions/hivemq-file-rbac-extension/conf/config.xml" /etc/systemd/system/hivemq.service "$BASE/tls/keystore.p12")
+HQ_BEFORE="$(sum "${HQ_FILES[@]}")"
 HQ="$BASE/hivemq"
 # 3.25: try the fork's build first; if its release isn't there (or HIVEMQ_SOURCE=official) use the official one
 HQ_TAG="official-$HIVEMQ_VER"
@@ -219,6 +265,11 @@ fi
 cp "$SRC_DIR/config/rbac-config.xml" "$RB/conf/config.xml"
 
 hash_pw() { "$JAVA_HOME/bin/java" -jar "$RB/hivemq-file-rbac-extension-$RBAC_VER.jar" -p "$1" -q 2>/dev/null | tail -1; }
+# 3.37 VPS: same passwords as last time = keep the file (the hashes are salted, a rewrite looked like a change)
+CRED_SUM="$(printf '%s\n' "$MP_USER" "$MP_PASS" "$WEB_USER" "$WEB_PASS" "$BRIDGE_PASS" "$ADMIN_PASS" | cat - "$SRC_DIR/config/credentials.xml.template" | sha256sum | cut -c1-16)"
+if [ -s "$RB/conf/credentials.xml" ] && [ "$(cat "$ETC/.cred.sum" 2>/dev/null)" = "$CRED_SUM" ]; then
+say "logins unchanged"
+else
 say "writing logins (hashed)"
 MP_HASH="$(hash_pw "$MP_PASS")"; WEB_HASH="$(hash_pw "$WEB_PASS")"
 BRIDGE_HASH="$(hash_pw "$BRIDGE_PASS")"; ADMIN_HASH="$(hash_pw "$ADMIN_PASS")"
@@ -227,6 +278,8 @@ sed -e "s|@@MP_USER@@|$MP_USER|; s|@@WEB_USER@@|$WEB_USER|" \
     -e "s|@@MP_HASH@@|$MP_HASH|; s|@@WEB_HASH@@|$WEB_HASH|; s|@@BRIDGE_HASH@@|$BRIDGE_HASH|; s|@@ADMIN_HASH@@|$ADMIN_HASH|" \
     "$SRC_DIR/config/credentials.xml.template" > "$RB/conf/credentials.xml"
 chmod 600 "$RB/conf/credentials.xml"
+echo "$CRED_SUM" > "$ETC/.cred.sum"; chmod 600 "$ETC/.cred.sum"
+fi   # 3.37 VPS (the RBAC extension re-reads credentials.xml by itself: no broker restart)
 
 # ---------------------------------------------------------------- TLS (optional)
 TLS_XML=""
@@ -251,8 +304,12 @@ chown mp:mp $KS; chmod 600 $KS
 systemctl restart hivemq
 EOF
     chmod 700 /etc/letsencrypt/renewal-hooks/deploy/mp-hivemq.sh
-    openssl pkcs12 -export -in "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" -inkey "/etc/letsencrypt/live/$DOMAIN/privkey.pem" \
-        -out "$KS" -name hivemq -passout "pass:$KS_PASS"
+    # 3.37 VPS: rebuild the keystore only for a new certificate (a rebuild every run restarted the broker)
+    if [ ! -s "$KS" ] || [ "$(readlink -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem")" -nt "$KS" ] || [ "$(cat "$ETC/.ks.pass.sum" 2>/dev/null)" != "$(printf %s "$KS_PASS" | sha256sum | cut -c1-16)" ]; then
+        openssl pkcs12 -export -in "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" -inkey "/etc/letsencrypt/live/$DOMAIN/privkey.pem" \
+            -out "$KS" -name hivemq -passout "pass:$KS_PASS"
+        printf %s "$KS_PASS" | sha256sum | cut -c1-16 > "$ETC/.ks.pass.sum"
+    fi
     tls_keystore="            <tls>
                 <keystore>
                     <path>$KS</path>
@@ -311,8 +368,9 @@ say "Java heap: -Xms$JVM_XMS -Xmx$JVM_XMX"
 SV="$BASE/server"
 if [ "${RUN_SERVER:-1}" = 1 ]; then
     say "building mp_server (the region's 24/7 default server)"
-    rm -rf "$BASE/src"; git clone -q --depth 1 "$MOD_REPO" "$BASE/src"
+    wagu_clone "$BASE/src" server src/net third_party/mbedtls   # 3.37 VPS: only the server source (fast)
     make -s -C "$BASE/src/server" -j"$CPUS" >/dev/null
+    [ "$(sum "$BASE/src/server/mp_server")" != "$(sum "$SV/mp_server")" ] && SERVER_BIN_CHANGED=1
     # 3.21: replace the binary with cp + mv. A plain cp onto the running mp_server fails with "Text file
     # busy" and set -e then aborted the whole update: the 24/7 servers silently kept the OLD mp_server
     # (old admin key refused, no direct UDP -> relay only ~400 ms, phones hosting the default server).
@@ -345,35 +403,51 @@ EOF
 fi
 
 # ---------------------------------------------------------------- bridge
-if [ "${RUN_BRIDGE:-0}" = 1 ]; then
-    say "setting up MpBridge (server lists of all regions)"
-    mkdir -p "$BASE/bridge"; cp "$SRC_DIR/bridge/MpBridge.java" "$BASE/bridge/"
+# 3.38: the public mirror (24/7 servers of this region also in the free public lobby) runs on every VPS
+RUN_MPBRIDGE=0; { [ "${RUN_BRIDGE:-0}" = 1 ] || [ "${PUBLIC_MIRROR:-1}" = 1 ]; } && RUN_MPBRIDGE=1
+[ "${RUN_SERVER:-1}" = 1 ] || [ "${RUN_BRIDGE:-0}" = 1 ] || RUN_MPBRIDGE=0
+if [ "$RUN_MPBRIDGE" = 1 ]; then
+    say "setting up MpBridge ($([ "${RUN_BRIDGE:-0}" = 1 ] && echo "server lists of all regions + ")public mirror)"
+    mkdir -p "$BASE/bridge"; BR_BEFORE="$(sum "$BASE/bridge/MpBridge.java" "$ETC/bridge.conf")"; cp "$SRC_DIR/bridge/MpBridge.java" "$BASE/bridge/"
     {
         echo "# generated by install.sh from HOST_* in $ENV_FILE"
         for r in Asia Europe NA Oceania; do
             v="HOST_${r^^}"; h="${!v:-}"
             [ "$r" = "$REGION" ] && h=127.0.0.1
+            [ "${RUN_BRIDGE:-0}" = 1 ] || [ "$r" = "$REGION" ] || h=   # mirror only: just this VPS's broker
             [ -n "$h" ] && echo "$r = mqtt://bridge:$BRIDGE_PASS@$h:1883"
         done
         echo "expire = 45"
         # 3.34: game branch (phones stay on the nearest region, the game crosses regions VPS to VPS)
         echo "branch = ${GAME_BRANCH:-on}"
+        # 3.38: public mirror - phones that can't reach this VPS's broker (blocked port, DuckDNS down)
+        # land in the free public lobby: they see this region's 4 24/7 servers there too and join the
+        # 24/7 bot host instead of hosting a phone copy that drops everybody when that phone leaves
+        if [ "${PUBLIC_MIRROR:-1}" = 1 ]; then
+            for m in ${PUBLIC_MIRROR_BROKERS:-mqtt://broker.hivemq.com:1883}; do echo "mirror = $m"; done
+            ri=0; case "${REGION,,}" in europe) ri=1;; na) ri=2;; oceania) ri=3;; esac
+            echo "mirror_region = $ri"
+        fi
     } > "$ETC/bridge.conf"
     chown mp:mp "$ETC/bridge.conf"; chmod 600 "$ETC/bridge.conf"
-    [ "$(grep -c '= mqtt' "$ETC/bridge.conf")" -ge 2 ] || warn "bridge.conf has fewer than 2 brokers: fill HOST_* in $ENV_FILE and run install.sh again"
+    [ "$(sum "$BASE/bridge/MpBridge.java" "$ETC/bridge.conf")" != "$BR_BEFORE" ] && BRIDGE_CHANGED=1
+    [ "$(grep -c '= mqtt' "$ETC/bridge.conf")" -ge 2 ] || [ "${RUN_BRIDGE:-0}" != 1 ] || warn "bridge.conf has fewer than 2 brokers: fill HOST_* in $ENV_FILE and run install.sh again"
 fi
 chown mp:mp "$ETC" "$ENV_FILE" 2>/dev/null || true
 
 # ---------------------------------------------------------------- 2.21: web console + status beacon
 TTYD_VER="1.7.7"
 CON="$BASE/console"; mkdir -p "$CON"
-cp "$SRC_DIR/tools/mp-console.sh" "$SRC_DIR/tools/status.sh" "$SRC_DIR/tools/mp-status.py" "$SRC_DIR/tools/mp-keepalive.sh" "$CON/"; chmod 755 "$CON"/*.sh "$CON"/*.py
+PY_BEFORE="$(sum "$CON/mp-status.py")"
+cp "$SRC_DIR/tools/mp-console.sh" "$SRC_DIR/tools/status.sh" "$SRC_DIR/tools/mp-status.py" "$SRC_DIR/tools/mp-keepalive.sh" \
+   "$SRC_DIR/tools/mp-net-tune.sh" "$SRC_DIR/tools/mp-xdp.sh" "$SRC_DIR/tools/mp-trim.sh" "$CON/"; chmod 755 "$CON"/*.sh "$CON"/*.py
+mkdir -p "$CON/../xdp"; cp "$SRC_DIR/xdp/mp_xdp.c" "$CON/../xdp/"   # 3.37 VPS
+[ "$(sum "$CON/mp-status.py")" != "$PY_BEFORE" ] && CHANGED+="mp-status "
 # keep a copy of this kit for the console's "update" choice
 # 3.21: the kit is a git clone, so "7) update" (git pull) really gets the new version
 if [ "$SRC_DIR" != "$BASE/kit" ]; then
     rm -rf "$BASE/kit"
-    if [ -d "$SRC_DIR/.git" ]; then cp -a "$SRC_DIR" "$BASE/kit"
-    else git clone -q --depth 1 "$KIT_REPO" "$BASE/kit" </dev/null 2>/dev/null || cp -a "$SRC_DIR" "$BASE/kit"; fi
+    cp -a "$SRC_DIR" "$BASE/kit"   # 3.37 VPS: update.sh fetches the newest kit from wagu itself
 fi
 chmod 755 "$BASE/kit/update.sh" 2>/dev/null || true
 if [ "${CONSOLE:-1}" = 1 ]; then
@@ -392,12 +466,16 @@ if [ "${CONSOLE:-1}" = 1 ]; then
         CON_SSL="-S -C /etc/letsencrypt/live/$DOMAIN/fullchain.pem -K /etc/letsencrypt/live/$DOMAIN/privkey.pem"; CON_BIND=""
     elif [ "${CONSOLE_INSECURE:-0}" = 1 ]; then CON_BIND=""; warn "web console without TLS (CONSOLE_INSECURE=1): the password travels in clear text"
     else warn "web console only on localhost: set a DOMAIN for https://DOMAIN:7681 (or CONSOLE_INSECURE=1)"; fi
+    CON_BEFORE="$(sum /etc/systemd/system/mp-console.service "$CON/ttyd")"
     sed -e "s|@@BASE@@|$BASE|g; s|@@BIND@@|$CON_BIND|; s|@@CRED@@|${CONSOLE_USER:-admin}:$CONSOLE_PASS|; s|@@SSL@@|$CON_SSL|" "$SRC_DIR/systemd/mp-console.service" > /etc/systemd/system/mp-console.service
     chmod 600 /etc/systemd/system/mp-console.service
+    [ "$(sum /etc/systemd/system/mp-console.service "$CON/ttyd")" != "$CON_BEFORE" ] && CHANGED+="mp-console "
     HOOK=/etc/letsencrypt/renewal-hooks/deploy/mp-hivemq.sh
     if [ -f "$HOOK" ] && ! grep -q mp-console "$HOOK"; then echo "systemctl restart mp-console" >> "$HOOK"; fi
 fi
+ST_BEFORE="$(sum /etc/systemd/system/mp-status.service)"
 sed -e "s|@@BASE@@|$BASE|g" "$SRC_DIR/systemd/mp-status.service" > /etc/systemd/system/mp-status.service
+[ "$(sum /etc/systemd/system/mp-status.service)" != "$ST_BEFORE" ] && CHANGED+="mp-status "
 
 # ---------------------------------------------------------------- 3.21.7: MP Railway (our own Railway)
 # Runs the MP Discord login bot (discordpy-bot) 24/7 with auto deploy. The tool is installed on every
@@ -415,6 +493,9 @@ fi
 # ---------------------------------------------------------------- systemd
 say "installing services"
 sed -e "s|@@JAVA_HOME@@|$JAVA_HOME|g; s|@@BASE@@|$BASE|g; s|@@XMS@@|$JVM_XMS|; s|@@XMX@@|$JVM_XMX|" "$SRC_DIR/systemd/hivemq.service" > /etc/systemd/system/hivemq.service
+[ "$(sum "${HQ_FILES[@]}")" != "$HQ_BEFORE" ] && CHANGED+="hivemq "
+# 3.37 VPS: a game server is restarted only when its binary or its service file changed
+for u in mp-server mp-bcw mp-mw3 mp-rp mp-legacy mp-bridge; do eval "U_BEFORE_${u//-/_}=\"\$(sum /etc/systemd/system/$u.service)\""; done
 sed -e "s|@@BASE@@|$BASE|g; s|@@PORT@@|${SERVER_PORT:-1922}|; s|@@NAME@@|${SERVER_NAME:-MP LAN Server}|; s|@@MAX@@|${MAX_PLAYERS:-100}|; s|@@REGION@@|$REGION|" "$SRC_DIR/systemd/mp-server.service" > /etc/systemd/system/mp-server.service
 sed -e "s|@@JAVA_HOME@@|$JAVA_HOME|g; s|@@BASE@@|$BASE|g; s|@@ETC@@|$ETC|g" "$SRC_DIR/systemd/mp-bridge.service" > /etc/systemd/system/mp-bridge.service
 # 3.04: Brief Case War 24/7 (UDP 1930)
@@ -428,22 +509,46 @@ sed -e "s|@@BASE@@|$BASE|g; s|@@REGION@@|$REGION|" "$SRC_DIR/systemd/mp-legacy.s
 # 3.33: keep-alive: the broker and the 4 featured servers must be online 24/7 (checked every minute)
 sed -e "s|@@BASE@@|$BASE|g" "$SRC_DIR/systemd/mp-keepalive.service" > /etc/systemd/system/mp-keepalive.service
 cp "$SRC_DIR/systemd/mp-keepalive.timer" /etc/systemd/system/mp-keepalive.timer
+# 3.37 VPS: tuning at boot, XDP filter, cache / log trim timer
+for u in mp-net-tune.service mp-xdp.service mp-trim.service; do sed -e "s|@@BASE@@|$BASE|g" "$SRC_DIR/systemd/$u" > "/etc/systemd/system/$u"; done
+cp "$SRC_DIR/systemd/mp-trim.timer" /etc/systemd/system/mp-trim.timer
+for u in mp-server mp-bcw mp-mw3 mp-rp mp-legacy mp-bridge; do
+    v="U_BEFORE_${u//-/_}"; [ "$(sum /etc/systemd/system/$u.service)" != "${!v}" ] && CHANGED+="$u "
+done
+[ "${SERVER_BIN_CHANGED:-0}" = 1 ] && CHANGED+="mp-server mp-bcw mp-mw3 mp-rp mp-legacy "
+[ "${BRIDGE_CHANGED:-0}" = 1 ] && CHANGED+="mp-bridge "
+[ "${MP_FORCE_RESTART:-0}" = 1 ] && CHANGED+="hivemq mp-server mp-bcw mp-mw3 mp-rp mp-legacy mp-bridge "
 systemctl daemon-reload
-systemctl enable --now hivemq >/dev/null
-systemctl restart hivemq
-if [ "${RUN_SERVER:-1}" = 1 ]; then systemctl enable mp-server >/dev/null; systemctl restart mp-server; else systemctl disable --now mp-server 2>/dev/null || true; fi
-if [ "${RUN_SERVER:-1}" = 1 ] && [ "${RUN_BCW:-1}" = 1 ]; then systemctl enable mp-bcw >/dev/null; systemctl restart mp-bcw; else systemctl disable --now mp-bcw 2>/dev/null || true; fi   # 3.04
-if [ "${RUN_SERVER:-1}" = 1 ] && [ "${RUN_MW3:-1}" = 1 ]; then systemctl enable mp-mw3 >/dev/null; systemctl restart mp-mw3; else systemctl disable --now mp-mw3 2>/dev/null || true; fi   # 3.23
-if [ "${RUN_SERVER:-1}" = 1 ] && [ "${RUN_RP:-1}" = 1 ]; then systemctl enable mp-rp >/dev/null; systemctl restart mp-rp; else systemctl disable --now mp-rp 2>/dev/null || true; fi   # 3.25
-if [ "${RUN_SERVER:-1}" = 1 ] && [ "${RUN_LEGACY:-1}" = 1 ]; then systemctl enable mp-legacy >/dev/null; systemctl restart mp-legacy; else systemctl disable --now mp-legacy 2>/dev/null || true; fi   # 3.04.6
-if [ "${RUN_BRIDGE:-0}" = 1 ]; then systemctl enable mp-bridge >/dev/null; systemctl restart mp-bridge; else systemctl disable --now mp-bridge 2>/dev/null || true; fi
-systemctl enable mp-status >/dev/null; systemctl restart mp-status
-if [ "${CONSOLE:-1}" = 1 ]; then systemctl enable mp-console >/dev/null; systemctl restart mp-console; else systemctl disable --now mp-console 2>/dev/null || true; fi
+# apply: start what is stopped, restart only what changed - players on an unchanged server stay connected
+up() {   # unit  wanted(1/0)
+    if [ "$2" != 1 ]; then systemctl disable --now "$1" 2>/dev/null || true; return 0; fi
+    systemctl enable "$1" >/dev/null 2>&1
+    if ! systemctl is-active --quiet "$1"; then systemctl start "$1" || true
+    elif [[ "$CHANGED" == *" $1 "* ]]; then say "restarting $1 (updated)"; systemctl restart "$1" || true
+    else say "$1 unchanged - kept running (no reconnect)"; fi
+}
+up hivemq 1
+S=${RUN_SERVER:-1}
+up mp-server "$S"
+up mp-bcw "$([ "$S" = 1 ] && [ "${RUN_BCW:-1}" = 1 ] && echo 1 || echo 0)"        # 3.04
+up mp-mw3 "$([ "$S" = 1 ] && [ "${RUN_MW3:-1}" = 1 ] && echo 1 || echo 0)"        # 3.23
+up mp-rp "$([ "$S" = 1 ] && [ "${RUN_RP:-1}" = 1 ] && echo 1 || echo 0)"          # 3.25
+up mp-legacy "$([ "$S" = 1 ] && [ "${RUN_LEGACY:-1}" = 1 ] && echo 1 || echo 0)"  # 3.04.6
+up mp-bridge "$RUN_MPBRIDGE"   # 3.38: + public mirror on every VPS
+if [ "${XDP:-1}" = 1 ]; then systemctl enable mp-xdp.service >/dev/null 2>&1; systemctl restart mp-xdp.service || true
+else systemctl disable --now mp-xdp.service 2>/dev/null || true; "$BASE/console/mp-xdp.sh" stop >/dev/null 2>&1 || true; fi
+systemctl enable --now mp-trim.timer >/dev/null 2>&1 || true
+up mp-status 1
+# 3.37 VPS: the web console is only restarted when it changed (an update started from the console kept going)
+up mp-console "${CONSOLE:-1}"
 systemctl enable --now mp-keepalive.timer >/dev/null 2>&1 || true   # 3.33
 
 # ---------------------------------------------------------------- network tuning + firewall
 cp "$SRC_DIR/config/99-mp-network.conf" /etc/sysctl.d/99-mp-network.conf
 sysctl -q --system || true
+# 3.37 VPS: NIC / CPU / conntrack tuning now (and at every boot)
+systemctl enable mp-net-tune.service >/dev/null 2>&1 || true
+systemctl restart mp-net-tune.service 2>/dev/null || true
 say "firewall: SSH, MQTT 1883, WebSocket 8000${DOMAIN:+, TLS 8883/8884}, game UDP ${SERVER_PORT:-1922} + 1930 (Brief Case War) + 1931 (MW3) + 1932 (Mega Vil RP)"
 ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null
 ufw allow 1883/tcp >/dev/null; ufw allow 8000/tcp >/dev/null
@@ -454,13 +559,25 @@ ufw allow 1930/udp >/dev/null   # 3.04: Brief Case War
 ufw allow 1931/udp >/dev/null   # 3.23: Modern Warfare 3
 ufw allow 1932/udp >/dev/null   # 3.25: Mega Vil Futuristic
 ufw deny 9010/tcp >/dev/null 2>&1 || true    # JMX (also switched off in the service)
+# 4.05.8: latency test server (sockperf) - UDP + TCP 11111. NETTEST=0 in mp.env leaves it off.
+if [ "${NETTEST:-1}" = 1 ]; then
+    if apt-get install -y -qq sockperf >/dev/null 2>&1; then
+        cp "$SRC_DIR/systemd/mp-sockperf.service" /etc/systemd/system/mp-sockperf.service
+        systemctl daemon-reload; systemctl enable --now mp-sockperf.service >/dev/null 2>&1 || true
+        ufw allow 11111/udp >/dev/null; ufw allow 11111/tcp >/dev/null
+        say "latency test: sockperf ping-pong -i <this host> -p 11111 (UDP) / --tcp"
+    else
+        say "sockperf not in this distro's packages - latency test server skipped"
+    fi
+fi
 ufw --force enable >/dev/null
 
 # ---------------------------------------------------------------- done
 sleep 6
 systemctl is-active --quiet hivemq && say "HiveMQ is running" || warn "HiveMQ did not start: journalctl -u hivemq -n 50"
 echo
-say "Done. This region: $REGION"
+say "Done. This region: $REGION   (restarted this run:${CHANGED})"
+echo "    speed:   sudo $BASE/console/mp-xdp.sh status   (XDP flood filter)   |  XDP=0 / XDP_PPS= / NOTRACK=0 in $ENV_FILE"
 echo "    status:  sudo $SRC_DIR/tools/status.sh     menu: sudo $BASE/console/mp-console.sh"
 if [ "${CONSOLE:-1}" = 1 ] && [ -n "${DOMAIN:-}" ]; then echo "    web console (website Termius page): https://$DOMAIN:7681  login ${CONSOLE_USER:-admin} / CONSOLE_PASS in $ENV_FILE"; fi
 echo "    logs:    journalctl -u hivemq -f    |  journalctl -u mp-server -f   |  journalctl -u mp-bcw -f   |  journalctl -u mp-mw3 -f   |  journalctl -u mp-rp -f   |  journalctl -u mp-legacy -f (old versions refused: $SV/outdated_clients.log)   |  journalctl -u mp-bridge -f"

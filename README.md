@@ -6,7 +6,7 @@ Self-hosted lobby servers for [MP Multiplayer](https://github.com/ThirtyFoxMCx00
 - the region's **24/7 default server** (`mp_server`, "MP LAN Server", UDP 1922)
 - optionally **MpBridge**, which joins the server lists of all regions (run it on one server only)
 
-The mod (2.20+) downloads [regions.txt](https://thirtyfoxmcx00e1.github.io/wagu/regions.txt) from the website, pings every region in the background and uses the fastest one. Players in Manila land on Asia, players in Berlin on Europe, and both still see every server in the list. Joining a server from another region moves that phone to that region's broker for the game, then back.
+The mod (2.20+) downloads [regions.txt](https://mpsamp-open.github.io/regions.txt) from the website, pings every region in the background and uses the fastest one. Players in Manila land on Asia, players in Berlin on Europe, and both still see every server in the list. Joining a server from another region moves that phone to that region's broker for the game, then back.
 
 ```
  phones (Asia)      phones (Europe)     phones (NA)       phones (Oceania)
@@ -21,7 +21,81 @@ Game traffic stays inside one region (no bridging), so ping is only phone -> nea
 
 
 
-> **Easiest way (3.32):** open the [MP Oracle page](https://thirtyfoxmcx00e1.github.io/wagu/oracle.html), paste a GitHub token
+## 3.39.1: saved progress, houses after rejoin
+
+- `progress.txt` (next to `homes.txt`, change it with `--progress-file PATH`) keeps every player's place, money, weapons + ammo, health, armour, hunger and energy. Default server: by account (after the login); custom servers: by account or phone. Not used on Brief Case War, MW3 or Mega Vil (they keep their own saves).
+- Houses come back after leaving + rejoining (owner matched by account, phone id or name); `/homedelete <name>` is saved at once.
+- A kicked player who rejoins during the 4:29 wait is refused with the seconds left.
+- The service update (mp-autoupdate, every 10 min) installs this by itself.
+
+## 3.39: Home Kit, rules, server settings, 4:29 kicks
+
+Update the 4 servers with the same one command as 3.38 (the installer pulls the new `mp_server`). New options:
+
+- `--gamemodes` knows 6 more names: `home` (Home Kit houses), `survival`, `cnr` (Cops and Robbers), `ad` (Attack / Defend), `stunt`, `drift`. The default server 1922 gets every new mode by itself; a custom server only gets the modes its owner lists (`--gamemodes all` or e.g. `--gamemodes home,cnr,drift`).
+- `--home-file PATH` - where the houses are saved (default `homes.txt`, Mega Vil `homes_rp.txt`).
+- `--rules "SERVER RULES|No cheating|Be nice|..."` - the RULES window after the login (title first, then up to 10 rules). The default server always shows its own 10 rules.
+- A kick is no longer a ban: everyone reads `[SERVER]: name got kicked by reason` and the player can join again after 4 minutes 29 seconds. `/ban` stays permanent.
+- On the 4 featured servers only the admin and moderators (moderator.txt) can kick, change settings, or host them from a phone; the 24/7 bot hosts them. On a custom server the host owner does it.
+
+## 3.38: 24/7 bot host on the 4 servers (no more "lost connection" when a player leaves)
+
+"Lost connection to the server" when the first player leaves = that player's **phone was the host**. It
+happens when phones can't see the 24/7 copy (the VPS is off, its IP changed, DuckDNS points to a dead
+address, or a phone's network blocks port 1883 and it fell back to the free public lobby). The phones
+then host the server themselves, and when that phone leaves everybody on it is moved to a new host.
+
+The 4 featured servers are hosted 24/7 by the bot **Broker** (`mp-server`, `mp-bcw`, `mp-mw3`, `mp-rp`,
+always in the player list as id 99). 3.38 makes sure every phone finds them:
+
+| Part | What it does |
+|---|---|
+| Public mirror (`PUBLIC_MIRROR=1`, default) | `mp-bridge` now runs on **every** VPS. It lists the region's 4 24/7 servers in the free public lobby (`broker.hivemq.com`) and carries their game frames both ways. Only those servers' upload topics are read there; nothing from the public lobby is copied in. Phones already on a phone copy move to the 24/7 one by themselves within 10 s. |
+| Console one-liner `curl -fsSL https://mpsamp-open.github.io/install.sh \| bash` | The 4 bot servers 24/7 on a Termux phone or any Linux box (PC, Termius / SSH). `mp-server status` shows all 4; restart forever, start after reboot (Termux:Boot / cron). |
+| Railway (or any Docker host) | Deploy the wagu repo: `Dockerfile` + `railway.json` build `mp_server` and run the 4 bot servers in one container (variable `REGION`, no ports needed, restart ALWAYS). |
+| `server/run_24_7.sh [region]` | The 4 bot servers on any always-on machine (home PC, old Android phone with Termux) without HiveMQ. Each restarts within 2 s. `./run_24_7.sh stop` stops them. |
+
+Check that the bot hosts are online (the `!d` = 24/7):
+
+```bash
+mosquitto_sub -h broker.hivemq.com -t 'thirtyfox/mp5/l/+' -v -W 6 | grep '!d'
+journalctl -u mp-bridge -f        # "public lobby: listing 24/7 server ..."
+```
+
+Settings in `/etc/mp-hivemq/mp.env`: `PUBLIC_MIRROR=0` turns the mirror off, `PUBLIC_MIRROR_BROKERS="mqtt://broker.hivemq.com:1883 mqtt://test.mosquitto.org:1883"` lists on more public brokers.
+
+## 3.37 VPS update: fast, steady ping with 100+ players
+
+The kit now lives in the **wagu repo** (`HiveMQ/` folder) - wagu is the only repo for the mod, the servers and the
+website ([mpsamp-open.github.io](https://mpsamp-open.github.io/)). `vps-setup.sh` and `update.sh`
+download only this folder (sparse clone), so a new VPS is set up fast.
+
+| What | Where | Effect |
+|---|---|---|
+| XDP flood filter | `xdp/mp_xdp.c`, `tools/mp-xdp.sh`, `mp-xdp.service` | runs on the network card before Linux: drops empty / oversized / type-0 packets and any IP over `XDP_PPS` (20000/s, high on purpose for carrier CGNAT) on UDP 1922 1930 1931 1932. Other regions' VPSes are never limited. Native XDP when the NIC supports it, generic XDP otherwise; if it can't load, the server just runs without it |
+| conntrack bypass | `tools/mp-net-tune.sh` | game UDP skips connection tracking (less CPU per packet, a full table can't drop game packets) |
+| NIC / CPU tuning | `tools/mp-net-tune.sh`, `mp-net-tune.service` | interrupt coalescing off, bigger RX ring, RPS over all CPUs, `performance` governor, THP defrag `defer` (no compaction stalls) |
+| kernel | `config/99-mp-network.conf` | bigger softirq budget, UDP minimum buffers, conntrack 262144, swappiness 10, small dirty-page bursts, faster dead-peer cleanup |
+| real-time packets | `src/net/server.cpp` (Linux VPS build only) | game socket marked DSCP EF + priority 6 |
+| no restart on join | `tools/mp-keepalive.sh` | a running server is restarted only after `KEEPALIVE_STRIKES` (3) failed checks in a row, never on one slow answer while 100 phones join |
+| no restart on update | `install.sh` | HiveMQ and each game server restart only when their files really changed (logins, TLS keystore and config are compared) - players stay connected. `MP_FORCE_RESTART=1` restarts all |
+| light broker | `config/config.xml.template` | sessions freed 2 min after a phone leaves (was 5), message expiry 10 min (was 60), queue 64 per client (newest state, not seconds of old positions), keep-alive 60 s |
+| cache / log trim | `tools/mp-trim.sh`, `mp-trim.timer` | every 6 h: journald 200 MB / 7 days, old HiveMQ logs, big server logs, apt cache, old /tmp. The Linux page cache is NOT dropped (that cache keeps the servers fast) |
+| priorities | `systemd/*.service` | game servers and the broker get the CPU first and are the last to be killed on low RAM |
+
+Settings (in `/etc/mp-hivemq/mp.env`): `XDP=1`, `XDP_PPS=20000`, `XDP_ALLOW=`, `XDP_FILTER=0` (1 = xdp-filter in front, see [docs/XDP_SETUP.md](../docs/XDP_SETUP.md)), `XDP_BLOCK=`, `NOTRACK=1`, `KEEPALIVE_STRIKES=3`.
+
+```
+sudo /opt/mp/console/mp-xdp.sh status     # XDP on/off + passed / dropped counters
+sudo /opt/mp/console/mp-xdp.sh allow IP   # never limit this IP
+sudo /opt/mp/console/mp-net-tune.sh off   # remove the conntrack bypass (XDP=0 + update.sh turns XDP off)
+journalctl -t mp-keepalive -t mp-xdp -t mp-net-tune -t mp-trim
+```
+
+Ping still depends on distance: a phone in Manila to a Frankfurt VPS is ~180 ms whatever the tuning. The tuning removes
+the spikes and the extra delay the server adds; for low ping everywhere, run one VPS per region (Asia, Europe, NA, Oceania).
+
+> **Easiest way (3.32):** open the [MP Oracle page](https://mpsamp-open.github.io/oracle.html), paste a GitHub token
 > (fine-grained, this repo only, Secrets + Variables + Actions = Read and write), the Oracle API key config text and the
 > private key file, pick the MP region and press **Save secrets + run claim**. The page encrypts everything in your browser
 > before it goes to GitHub and shows the server IP when the claim finishes.
@@ -35,19 +109,19 @@ Game traffic stays inside one region (no bridging), so ping is only phone -> nea
 On a new VPS (Ubuntu 22.04 / 24.04 or Debian 12), as root - installs everything for a region (Asia on `mpsamp.duckdns.org` by default) with the bridge, uses the passwords from the public regions.txt (phones connect with no change) and starts the 24/7 servers, Mega Vil Futuristic included:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/vps-setup.sh | sudo bash
+curl -fsSL https://mpsamp-open.github.io/HiveMQ/vps-setup.sh | sudo bash
 ```
 
 All four regions (one VPS each):
 
 | Region | DuckDNS | On the VPS |
 |---|---|---|
-| Asia | mpsamp.duckdns.org | `curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/vps-setup.sh \| sudo bash -s asia` |
-| Europe | eusamp.duckdns.org | `curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/vps-setup.sh \| sudo bash -s europe` |
-| NA | nasamp.duckdns.org | `curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/vps-setup.sh \| sudo bash -s na` |
-| Oceania | ocsamp.duckdns.org | `curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/vps-setup.sh \| sudo bash -s oceania` |
+| Asia | mpsamp.duckdns.org | `curl -fsSL https://mpsamp-open.github.io/HiveMQ/vps-setup.sh \| sudo bash -s asia` |
+| Europe | eusamp.duckdns.org | `curl -fsSL https://mpsamp-open.github.io/HiveMQ/vps-setup.sh \| sudo bash -s europe` |
+| NA | nasamp.duckdns.org | `curl -fsSL https://mpsamp-open.github.io/HiveMQ/vps-setup.sh \| sudo bash -s na` |
+| Oceania | ocsamp.duckdns.org | `curl -fsSL https://mpsamp-open.github.io/HiveMQ/vps-setup.sh \| sudo bash -s oceania` |
 
-From Termux on a phone: `pkg install -y openssh && ssh root@YOUR_VPS_IP "curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/vps-setup.sh | bash -s europe"`. Point the DuckDNS name at the VPS first and open the ports (see Cloud firewall).
+From Termux on a phone: `pkg install -y openssh && ssh root@YOUR_VPS_IP "curl -fsSL https://mpsamp-open.github.io/HiveMQ/vps-setup.sh | bash -s europe"`. Point the DuckDNS name at the VPS first and open the ports (see Cloud firewall).
 
 ## MP Oracle: free Oracle server by itself
 
@@ -85,11 +159,31 @@ Login from `~/.oci/config` or the same `OCI_*` environment values. `--dry-run` s
 Rules from Oracle: free servers only in the home region, 2 OCPU + 12 GB of A1 in total, one account per person.
 So one account covers one MP region. For the other regions use the owner's own account (a team member there) or a paid VPS with `vps-setup.sh`.
 
+### 5.00.04: every region on its own Oracle server, near its players
+
+- One login per region, claimed in parallel: add `OCI_USER_EUROPE`, `OCI_TENANCY_EUROPE`, `OCI_FINGERPRINT_EUROPE`,
+  `OCI_REGION_EUROPE`, `OCI_KEY_EUROPE` (same with `_ASIA`, `_NA`, `_OCEANIA`; optional `DUCKDNS_TOKEN_<REGION>`).
+  A friend who lives in that region makes the free account there (Frankfurt, Ashburn, Sydney...), so that region's
+  server is near its players instead of near the owner. Regions without a login are skipped.
+- `python3 oracle/mp_oracle.py regioncheck` (also runs in the workflow, no login needed) shows where every region
+  name really is and warns when two names are the same machine or a name sits on another continent.
+  Today all four names point at one home IP in the Philippines, so Europe / NA / Oceania players ping Mindanao.
+  Fix: on duckdns.org point each name at that region's server, and let a home updater only touch its own name.
+- The server keeps its DuckDNS name on both IPv4 and IPv6 (every 5 minutes), like
+  [ha-duckdns_ipv4_ipv6](https://github.com/lfhohmann/ha-duckdns_ipv4_ipv6) and
+  [duckdns-mirror](https://github.com/BenjaminHCCarr/duckdns-mirror).
+- Custom servers on phones: the game now finds the host's own location and address (router UPnP mapping or the
+  host's own free DuckDNS name in Server console), so friends connect straight to the host - the ping is the
+  real distance to the host, not to this broker. Mobile data (carrier NAT) still goes through the broker.
+- Other brokers that speak the same MQTT: [emqx-docker](https://github.com/ThirtyFoxMCx00E1/emqx-docker),
+  [rmqtt](https://github.com/ThirtyFoxMCx00E1/rmqtt) (small Rust broker for 1 GB servers like the Oracle E2 Micro);
+  test clients in [MQTT-Client-Examples](https://github.com/ThirtyFoxMCx00E1/MQTT-Client-Examples).
+
 ## Debian 12 (own PC or VPS)
 
-Debian 12 works the same as Ubuntu and is a much smaller download. Our copy of the official installer is in the [Derbian release](https://github.com/ThirtyFoxMCx00E1/HiveMQ/releases/tag/Derbian):
+Debian 12 works the same as Ubuntu and is a much smaller download. The official installer is on [Debian's archive](https://cdimage.debian.org/cdimage/archive/12.15.0/amd64/iso-cd/):
 
-- [debian-12.15.0-amd64-netinst.iso](https://github.com/ThirtyFoxMCx00E1/HiveMQ/releases/download/Derbian/debian-12.15.0-amd64-netinst.iso) (677 MB, x86_64)
+- [debian-12.15.0-amd64-netinst.iso](https://cdimage.debian.org/cdimage/archive/12.15.0/amd64/iso-cd/debian-12.15.0-amd64-netinst.iso) (677 MB, x86_64)
 - sha256 `cd4462c06aa8892e692c0c4b9c17802f38c8ab8690e85cbfb5ccaa5956e9af17` (same as Debian's own [SHA256SUMS](https://cdimage.debian.org/cdimage/archive/latest-oldstable/amd64/iso-cd/SHA256SUMS))
 
 On a VPS you don't need the ISO: pick "Debian 12" in the provider's image list. For your own PC, write the ISO to a USB stick (Rufus or balenaEtcher) and boot from it. The netinst installer downloads the rest while it installs, so keep the PC online.
@@ -100,12 +194,12 @@ On a VPS you don't need the ISO: pick "Debian 12" in the provider's image list. 
 
 | Region | DuckDNS | On the Debian machine, as root |
 |---|---|---|
-| Asia | mpsamp.duckdns.org | `wget -qO- https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/vps-setup.sh \| bash -s asia` |
-| Europe | eusamp.duckdns.org | `wget -qO- https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/vps-setup.sh \| bash -s europe` |
-| NA | nasamp.duckdns.org | `wget -qO- https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/vps-setup.sh \| bash -s na` |
-| Oceania | ocsamp.duckdns.org | `wget -qO- https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/vps-setup.sh \| bash -s oceania` |
+| Asia | mpsamp.duckdns.org | `wget -qO- https://mpsamp-open.github.io/HiveMQ/vps-setup.sh \| bash -s asia` |
+| Europe | eusamp.duckdns.org | `wget -qO- https://mpsamp-open.github.io/HiveMQ/vps-setup.sh \| bash -s europe` |
+| NA | nasamp.duckdns.org | `wget -qO- https://mpsamp-open.github.io/HiveMQ/vps-setup.sh \| bash -s na` |
+| Oceania | ocsamp.duckdns.org | `wget -qO- https://mpsamp-open.github.io/HiveMQ/vps-setup.sh \| bash -s oceania` |
 
-The script installs curl, git, Java 21 and HiveMQ by itself. Updates later: `wget -qO- https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/update.sh | bash` (as root).
+The script installs curl, git, Java 21 and HiveMQ by itself. Updates later: `wget -qO- https://mpsamp-open.github.io/HiveMQ/update.sh | bash` (as root).
 
 Ping depends on where the machine is, not on the system: a Debian PC in the Philippines is still far from Europe, NA and Oceania. For those regions use a VPS in Frankfurt, Virginia / Ohio or Sydney.
 
@@ -116,7 +210,7 @@ Railway.app stopped taking new accounts, so the MP login bot ([discordpy-bot](ht
 On **one** server (the Asia / bridge server), once:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/update.sh | sudo bash   # new kit + mp-railway tool
+curl -fsSL https://mpsamp-open.github.io/HiveMQ/update.sh | sudo bash   # new kit + mp-railway tool
 sudo mp-railway setup                                                                            # asks DISCORD_TOKEN + AUTH_PRIVATE_KEY (hidden)
 ```
 
@@ -127,7 +221,7 @@ What MP Railway does (like Railway, without the cloud):
 - clones the bot repo to `/opt/mp/railway/discordpy-bot`, builds it (Python venv + `requirements.txt`, or `npm` for Node apps), starts the `Procfile` command as the `mp-railway@discordpy-bot` systemd service (own user `mprail`, restart on crash, start on boot)
 - **auto deploy:** `mp-railway-watch.timer` checks GitHub every 2 minutes; a new commit on `main` is built and restarted by itself (`/opt/mp/railway/discordpy-bot/deploys.log`)
 - secrets in `/etc/mp-railway/discordpy-bot.env` (mode 600, never in git), accounts in `/var/lib/mp-railway/discordpy-bot/accounts.db`
-- the bot publishes a signed status every 30 s; the website's [Railway page](https://thirtyfoxmcx00e1.github.io/wagu/railway.html) shows it live (checked with the mod's public key, so it can't be faked)
+- the bot publishes a signed status every 30 s; the website's [Railway page](https://mpsamp-open.github.io/railway.html) shows it live (checked with the mod's public key, so it can't be faked)
 
 ```
 sudo mp-railway status            online / crashing / offline, commit, servers with the commands
@@ -138,7 +232,7 @@ sudo mp-railway env               variables (masked)     sudo mp-railway env set
 sudo mp-railway add NAME REPO     host another Python / Node app the same way
 ```
 
-Without a VPS it also runs on an Android phone in Termux: `curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/railway/install.sh | bash` (Termux:Boot starts it after a reboot). Run the bot in **one** place only.
+Without a VPS it also runs on an Android phone in Termux: `curl -fsSL https://mpsamp-open.github.io/HiveMQ/railway/install.sh | bash` (Termux:Boot starts it after a reboot). Run the bot in **one** place only.
 
 
 ## MP 3.34: region branches, 24/7 bot host, lower ping with many players
@@ -149,11 +243,11 @@ This kit now also lives inside the main repo: [wagu/HiveMQ](https://github.com/T
 - **No ping climb when 25 / 100 players join:** `mp_server` keeps a per-player send budget (far players are sent less often when the server is full, near players and shots always go first), and the phone measures ping on its own channel so it is not stuck behind game packets.
 - **The 4 servers stay online 24/7 with the bot (1/100):** MP LAN Server, Brief Case War, Modern Warfare 3 and Mega Vil Futuristic always show the bot as a player, even when nobody plays. `mp-keepalive` now also **asks every server like the lobby does** (UDP query) and restarts one that has its port open but does not answer (hung / frozen), so the list never shows it offline.
 - **Console autobot:** the Termius / Termux pages run several bot typers at once (one per lane), each in its own endless loop, so the console never gets stuck on one long command.
-- **Discord bot:** the in-game `/stats` and `/char` are `/statsdc` and `/chardc` in Discord.
+- **Discord bot:** `/stats` works in the game and in Discord (Discord: Switch view = the character card; was `/statsdc`); `/help` in Discord is the tutorial (4.13.15, replaces `/chardc`); `/streaming on|off|status` plays the YouTube live 24/7 in a voice channel (4.13.16: sound by the bot; 4.13.17: Watch video button = Watch Together video inside the voice channel, since Discord blocks Go Live for bots).
 
 ## MP 3.33: the 4 servers run only here, 24/7 - no Broker bot, lower ping
 
-Run the update on every region (Termius console **7) update**, or `curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/update.sh | sudo bash`). New in 3.33:
+Run the update on every region (Termius console **7) update**, or `curl -fsSL https://mpsamp-open.github.io/HiveMQ/update.sh | sudo bash`). New in 3.33:
 
 - **The 4 featured servers are hosted by this machine only:** MP LAN Server (UDP 1922), Brief Case War (1930), Modern Warfare 3 (1931), Mega Vil Futuristic (1932). The **Broker bot is gone** (the server shows 0 players when empty) and no phone hosts them any more (the 100-rank Broker standby is off). A player who joins first is just a player, never the host. While a server restarts, 3.33 phones wait and reconnect by themselves.
 - **Always online:** the four units restart 2 s after a crash (`RestartSec=2`, no start limit) and the new **`mp-keepalive.timer`** checks every minute that the broker and the four servers are running and that their port is open, and starts / restarts them when not. Log: `journalctl -t mp-keepalive`.
@@ -164,7 +258,7 @@ Run the update on every region (Termius console **7) update**, or `curl -fsSL ht
 ## Auto update (3.23.5)
 
 The autopilot (mp-status) checks GitHub every 10 minutes. When the mod or this kit has a new version it runs
-`curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/update.sh | sudo bash` by itself
+`curl -fsSL https://mpsamp-open.github.io/HiveMQ/update.sh | sudo bash` by itself
 (unit `mp-autoupdate`, log: `journalctl -u mp-autoupdate`). `MP_AUTOUPDATE=0` in `/etc/mp-hivemq/mp.env` turns it off.
 It also restarts mp-bcw, mp-mw3, mp-rp and mp-legacy when they stop. Servers older than this need the command run once by hand.
 
@@ -173,7 +267,7 @@ It also restarts mp-bcw, mp-mw3, mp-rp and mp-legacy when they stop. Servers old
 Run this on every region (or Termius console **7) update**, which now runs the same script):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/update.sh | sudo bash
+curl -fsSL https://mpsamp-open.github.io/HiveMQ/update.sh | sudo bash
 ```
 
 - **Why the old servers never updated:** `install.sh` copied the new `mp_server` over the running one. Linux refuses that ("Text file busy"), and `set -e` stopped the whole update, so the regions kept an old `mp_server`. That old server refuses SENJI's new admin key (`administrator.txt`), and phones kept becoming the host of the default server. Fixed: the binary is now copied to `mp_server.new` and renamed, and the kit in `/opt/mp/kit` is a real git clone (the old copy had no `.git`, so `git pull` in menu 7 failed too).
@@ -230,7 +324,7 @@ Rebuild `mp_server` on every region (console menu **7) update**). New in 3.00:
 | NA | `nasamp.duckdns.org` | |
 | Oceania | `ocsamp.duckdns.org` | |
 
-All four use the same `mp.env` (same `mp` / `web` / bridge / admin passwords); only `REGION` and `DOMAIN` differ. The public part is in the website's [regions.txt](https://thirtyfoxmcx00e1.github.io/wagu/regions.txt). Keep `mp.env` private.
+All four use the same `mp.env` (same `mp` / `web` / bridge / admin passwords); only `REGION` and `DOMAIN` differ. The public part is in the website's [regions.txt](https://mpsamp-open.github.io/regions.txt). Keep `mp.env` private.
 
 ## Server requirements
 
@@ -253,7 +347,7 @@ Pick each VPS in a data center close to its players, e.g. Singapore or Tokyo for
 ### 1. First region (with the bridge)
 
 ```bash
-git clone https://github.com/ThirtyFoxMCx00E1/HiveMQ
+git clone https://github.com/ThirtyFoxMCx00E1/wagu/tree/main/HiveMQ
 cd HiveMQ
 sudo ./install.sh --region Asia --domain asia-you.duckdns.org --email you@mail.com --bridge
 ```
@@ -317,7 +411,7 @@ Everything below works from a phone browser, no SSH app and no computer:
 1. Create a free domain at [duckdns.org](https://www.duckdns.org) (e.g. `asia-yourname`) and copy the token.
 2. Create an Ubuntu 22.04/24.04 VM (e.g. Oracle Cloud Always Free, Ampere A1). In "Advanced options -> cloud-init / user data", paste [`cloud-init/user-data.yaml`](cloud-init/user-data.yaml) with your region, DuckDNS name, token and email filled in. In the cloud firewall (Oracle: VCN security list) open TCP 80, 1883, 8000, 8883, 8884, 7681 and UDP 1922.
 3. Wait about 10 minutes. The VM installs Java 21, HiveMQ CE, the 24/7 server, the status beacon and the web console by itself.
-4. Open the website's [Termius page](https://thirtyfoxmcx00e1.github.io/wagu/termius.html): the region turns green ("online 24/7") as soon as the status beacon reports. Tap "console" (https://DOMAIN:7681) and log in as `admin`; the password is `CONSOLE_PASS` in `/etc/mp-hivemq/mp.env` (read it once through the cloud provider's serial console or `sudo cat` in the web shell of the provider).
+4. Open the website's [Termius page](https://mpsamp-open.github.io/termius.html): the region turns green ("online 24/7") as soon as the status beacon reports. Tap "console" (https://DOMAIN:7681) and log in as `admin`; the password is `CONSOLE_PASS` in `/etc/mp-hivemq/mp.env` (read it once through the cloud provider's serial console or `sudo cat` in the web shell of the provider).
 5. In the console menu choose 8 (regions.txt) and copy the block into `docs/regions.txt` of the wagu repo. Every copy of the mod then uses your broker automatically.
 
 The web console is [ttyd](https://github.com/tsl0922/ttyd) behind TLS and a password: live logs, restart, update, status and a bash shell. Without a domain it only listens on localhost (set `CONSOLE_INSECURE=1` in `mp.env` to allow plain http, not recommended).
@@ -335,7 +429,7 @@ HiveMQ retires the free HiveMQ Cloud Serverless plan on 2026-12-31 and no new Se
 Nobody has to type in a terminal any more.
 
 - **On every region server** `mp-status` (the status beacon) is also the autopilot. Every 5 s it checks `hivemq`, `mp-server`, `mp-bridge` and `mp-console`; an enabled service that stopped is restarted (max 3 times in 10 minutes, then it waits and reports). Disk above 90 % = journal vacuum + old HiveMQ logs removed. Every action is published on `thirtyfox/mp4/bot/<Region>`. Turn it off with `MP_AUTOPILOT=0` in `/etc/mp-hivemq/mp.env`.
-- **On the website** the MP Bot runs the [Termius](https://thirtyfoxmcx00e1.github.io/wagu/termius.html) and [Termux](https://thirtyfoxmcx00e1.github.io/wagu/termux.html) terminals by itself: it types each command, presses Enter, and reacts to what it sees (region down -> `diagnose`, autopilot report -> `autopilot`, new servers -> `servers`, ping every 90 s). There is no input box.
+- **On the website** the MP Bot runs the [Termius](https://mpsamp-open.github.io/termius.html) and [Termux](https://mpsamp-open.github.io/termux.html) terminals by itself: it types each command, presses Enter, and reacts to what it sees (region down -> `diagnose`, autopilot report -> `autopilot`, new servers -> `servers`, ping every 90 s). There is no input box.
 - Run `install.sh` again (or `mp-server update` style re-run of cloud-init) on existing regions to get the new topic rule for `bot/+`.
 
 ## Daily use
@@ -390,7 +484,7 @@ Why Community Edition: the HiveMQ Enterprise download without a license is an ev
 
 ## Tagalog
 
-Walang Ubuntu? Puwede ang Debian 12 (677 MB lang): i-download ang ISO sa [Derbian release](https://github.com/ThirtyFoxMCx00E1/HiveMQ/releases/tag/Derbian), i-install (SSH server + standard system utilities lang), tapos bilang root: `wget -qO- https://raw.githubusercontent.com/ThirtyFoxMCx00E1/HiveMQ/main/vps-setup.sh | bash -s europe` (o `asia` / `na` / `oceania`).
+Walang Ubuntu? Puwede ang Debian 12 (677 MB lang): i-download ang ISO sa [Debian archive](https://cdimage.debian.org/cdimage/archive/12.15.0/amd64/iso-cd/), i-install (SSH server + standard system utilities lang), tapos bilang root: `wget -qO- https://mpsamp-open.github.io/HiveMQ/vps-setup.sh | bash -s europe` (o `asia` / `na` / `oceania`).
 
 MP Oracle: ilagay ang Oracle API key sa repo Secrets (OCI_USER, OCI_TENANCY, OCI_FINGERPRINT, OCI_REGION, OCI_KEY), tapos Actions -> MP Oracle claim -> Run. Paulit-ulit itong susubok hanggang may libreng server, tapos kusa nang mag-iinstall.
 
